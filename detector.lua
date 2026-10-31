@@ -1,12 +1,16 @@
 --!strict
 --[[
     ========================================================================
-    SISTEMA MODULAR DE ESP EXCLUSIVO PARA HUEVOS LIBRES EN EL MAPA
+    SISTEMA DE ESP EXCLUSIVO PARA HUEVOS LIBRES EN EL MAPA
     ========================================================================
-    Filtro estricto que ignora:
-      - Botones de compra / Pads / Stands
-      - Puntos de spawn / Waypoints
-      - Huevos ya recolectados o colocados en bases / plots de jugadores
+    Entorno: Roblox Studio (LocalScript)
+    Ubicación recomendada: StarterPlayer -> StarterPlayerScripts (o StarterGui)
+
+    Filtro estricto que CORRIGE y DESMALLA:
+      - Treadmills (cintas / caminadoras)
+      - Egg Fuse Machines (máquinas de fusión)
+      - Botones, Pads, Displays y Puntos de spawn
+      - Huevos ya recolectados o colocados en bases/plots de jugadores
 ]]
 
 local Players = game:GetService("Players")
@@ -16,39 +20,45 @@ local localPlayer = Players.LocalPlayer
 local playerGui = localPlayer:WaitForChild("PlayerGui")
 
 ------------------------------------------------------------------------
--- 1. CONFIGURACIÓN Y LISTAS NEGRAS DE FILTRADO
+-- 1. CONFIGURACIÓN Y LISTAS NEGRAS ESTRICTAS
 ------------------------------------------------------------------------
 local CONFIG = {
     GuiIdentifier = "CustomVisualESP_Container",
 
-    -- Palabras clave positivas requeridas en el nombre
+    -- Palabras clave que debe tener el huevo
     Keywords = {"egg", "huevo"},
 
-    -- Palabras negras: si el objeto contiene alguna de estas, SE IGNORA
-    BlacklistKeywords = {
-        "button", "boton", "pad", "stand", "spawn", "spawner", "point", 
-        "punto", "buy", "shop", "tienda", "prompt", "hitbox", "collider",
-        "zone", "zona", "area", "teleport", "door", "puerta", "display"
+    -- EXCLUSIONES EXPLÍCITAS: Si el objeto o su modelo contiene alguna de estas, SE IGNORA
+    Blacklist = {
+        -- Máquinas y elementos del mapa que NO son huevos recolectables
+        "treadmill", "caminadora", "cinta",
+        "fuse", "fusion", "machine", "maquina",
+        
+        -- Botones, tiendas, pads y puntos de spawn
+        "button", "boton", "pad", "stand", "spawn", "spawner", 
+        "point", "punto", "buy", "compra", "shop", "tienda", 
+        "display", "altar", "pedestal", "hatch", "zone", "zona",
+        "upgrade", "door", "puerta", "portal"
     },
 
-    -- Nombres de carpetas o ancestros prohibidos (bases de jugadores, tiendas, etc.)
+    -- Carpetas de jugadores donde los huevos ya están colocados/reclamados
     BlacklistAncestors = {
         "plot", "plots", "base", "bases", "tycoon", "tycoons", 
-        "stand", "stands", "shop", "shops", "store", "incubator"
+        "stand", "stands", "house", "casa", "inventory", "incubator"
     },
 
-    -- Visuales
-    HighlightColor = Color3.fromRGB(255, 185, 45),
+    -- Visuales del Huevo
+    HighlightColor = Color3.fromRGB(255, 185, 45),     -- Dorado
     HighlightOutline = Color3.fromRGB(255, 255, 255),
     FillTransparency = 0.5,
-    OutlineTransparency = 0.1,
+    OutlineTransparency = 0.15,
     TextSize = 12,
     StudsOffset = Vector3.new(0, 2.5, 0),
     UpdateInterval = 0.1,
 }
 
 ------------------------------------------------------------------------
--- 2. LIMPIEZA PREVIA
+-- 2. CONTROL DE INSTANCIAS PREVIAS (Idempotencia)
 ------------------------------------------------------------------------
 local function cleanupPreviousInstances()
     local existingContainer = playerGui:FindFirstChild(CONFIG.GuiIdentifier)
@@ -77,23 +87,23 @@ type TrackedEntry = {
 local trackedRegistry: {[Instance]: TrackedEntry} = {}
 
 ------------------------------------------------------------------------
--- 4. FILTRADO ESTRICTO DE HUEVOS LIBRES
+-- 4. FILTRADO ESTRICTO DE HUEVOS
 ------------------------------------------------------------------------
 
--- Comprueba si el objeto pertenece a una base, plot o tienda de jugadores
-local function isInBlacklistedAncestor(instance: Instance): boolean
+-- Comprueba si el objeto pertenece a una base o plot de algún jugador
+local function isInPlayerBase(instance: Instance): boolean
     local current: Instance? = instance.Parent
     while current and current ~= workspace do
         local parentName = string.lower(current.Name)
 
-        -- 1. Verificar nombres de carpetas de bases/plots
+        -- Verificar si la carpeta coincide con nombres de bases/plots
         for _, blackName in ipairs(CONFIG.BlacklistAncestors) do
             if string.find(parentName, blackName) then
                 return true
             end
         end
 
-        -- 2. Si la carpeta tiene un atributo o valor "Owner" (dueño de la base)
+        -- Si la estructura tiene dueño asignado (Owner / OwnerValue)
         if current:GetAttribute("Owner") or current:FindFirstChild("Owner") or current:FindFirstChild("OwnerValue") then
             return true
         end
@@ -103,33 +113,45 @@ local function isInBlacklistedAncestor(instance: Instance): boolean
     return false
 end
 
--- Determina si es exactamente un huevo libre del mapa para robar/recoger
+-- Determina si una cadena contiene alguna palabra de la lista negra
+local function containsBlacklistedWord(text: string): boolean
+    local lower = string.lower(text)
+    for _, word in ipairs(CONFIG.Blacklist) do
+        if string.find(lower, word) then
+            return true
+        end
+    end
+    return false
+end
+
+-- Valida que sea única y exclusivamente un huevo libre en el mapa
 local function isValidFreeEgg(instance: Instance): (boolean, BasePart?)
-    -- Solo nos interesan Models o BaseParts principales
     if not (instance:IsA("Model") or instance:IsA("BasePart")) then
         return false, nil
     end
 
-    -- Descartar si pertenece al personaje de cualquier jugador
+    -- 1. Descartar si pertenece a un personaje
     if instance:FindFirstAncestorWhichIsA("Player") or instance:FindFirstChildOfClass("Humanoid") then
         return false, nil
     end
 
-    -- Descartar si está en la base/plot de un jugador
-    if isInBlacklistedAncestor(instance) then
+    -- 2. Descartar si está en la base / plot de un jugador
+    if isInPlayerBase(instance) then
         return false, nil
     end
 
-    local nameLower = string.lower(instance.Name)
-
-    -- Descartar si el nombre contiene palabras clave de botones, pads, spawns, etc.
-    for _, blackWord in ipairs(CONFIG.BlacklistKeywords) do
-        if string.find(nameLower, blackWord) then
-            return false, nil
-        end
+    -- 3. Descartar si el nombre del objeto es una máquina (Treadmill, Fuse), botón, etc.
+    if containsBlacklistedWord(instance.Name) then
+        return false, nil
     end
 
-    -- Debe contener "egg" o "huevo"
+    -- 4. Descartar si su padre directo o modelo superior es una máquina
+    if instance.Parent and instance.Parent ~= workspace and containsBlacklistedWord(instance.Parent.Name) then
+        return false, nil
+    end
+
+    -- 5. Debe contener "egg" o "huevo"
+    local nameLower = string.lower(instance.Name)
     local hasKeyword = false
     for _, kw in ipairs(CONFIG.Keywords) do
         if string.find(nameLower, kw) then
@@ -142,21 +164,19 @@ local function isValidFreeEgg(instance: Instance): (boolean, BasePart?)
         return false, nil
     end
 
-    -- Si es un Modelo, asegurarse de que no sea una estación o máquina
+    -- 6. Si es un Modelo complejo, comprobar que no sea una estación o máquina con piezas internas
     if instance:IsA("Model") then
-        -- Si contiene partes que dicen "Base", "Stand" o "Pad", ignorar
         for _, child in ipairs(instance:GetChildren()) do
-            local childName = string.lower(child.Name)
-            if string.find(childName, "pad") or string.find(childName, "stand") then
+            if containsBlacklistedWord(child.Name) then
                 return false, nil
             end
         end
     end
 
-    -- Obtener la parte física representativa
+    -- 7. Obtener la parte física
     local basePart: BasePart? = nil
     if instance:IsA("BasePart") then
-        -- Si es una parte transparente invisible (ej. hitbox de zona), ignorar
+        -- Ignorar partes invisibles (triggers/hitboxes)
         if instance.Transparency >= 0.95 and not instance:FindFirstChildOfClass("SpecialMesh") then
             return false, nil
         end
@@ -173,7 +193,7 @@ local function isValidFreeEgg(instance: Instance): (boolean, BasePart?)
 end
 
 ------------------------------------------------------------------------
--- 5. CREACIÓN Y DESTRUCCIÓN DE ELEMENTOS VISUALES
+-- 5. VISUALES (HIGHLIGHT + BILLBOARDGUI)
 ------------------------------------------------------------------------
 local function removeVisuals(targetInstance: Instance)
     local entry = trackedRegistry[targetInstance]
@@ -195,7 +215,7 @@ end
 local function createVisuals(targetInstance: Instance, targetPart: BasePart)
     if trackedRegistry[targetInstance] then return end
 
-    -- 1. Resaltado (Highlight)
+    -- Highlight (silueta visible a través de paredes)
     local highlight = Instance.new("Highlight")
     highlight.Name = "ESP_Highlight_" .. targetInstance.Name
     highlight.Adornee = targetInstance
@@ -206,7 +226,7 @@ local function createVisuals(targetInstance: Instance, targetPart: BasePart)
     highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
     highlight.Parent = espFolder
 
-    -- 2. Marcador flotante (BillboardGui)
+    -- BillboardGui (nombre y distancia flotante)
     local billboard = Instance.new("BillboardGui")
     billboard.Name = "ESP_Billboard_" .. targetInstance.Name
     billboard.Adornee = targetPart
@@ -224,13 +244,13 @@ local function createVisuals(targetInstance: Instance, targetPart: BasePart)
     label.TextColor3 = CONFIG.HighlightColor
     label.TextStrokeTransparency = 0.2
     label.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
-    label.Text = string.format("🥚 %s\n[--]", targetInstance.Name)
+    label.Text = string.format("🥚 %s\n[-- studs]", targetInstance.Name)
     label.Parent = billboard
 
-    -- 3. Limpieza automática si el huevo es recogido o destruido
+    -- Limpieza reactiva si el huevo es tomado o movido a una base
     local ancestryConn: RBXScriptConnection
     ancestryConn = targetInstance.AncestryChanged:Connect(function(_, parent)
-        if not parent or isInBlacklistedAncestor(targetInstance) then
+        if not parent or isInPlayerBase(targetInstance) then
             removeVisuals(targetInstance)
         end
     end)
@@ -255,18 +275,15 @@ end
 ------------------------------------------------------------------------
 -- 6. ESCANEO Y DETECCIÓN EN TIEMPO REAL
 ------------------------------------------------------------------------
--- Escaneo inicial
 for _, desc in ipairs(workspace:GetDescendants()) do
     evaluateInstance(desc)
 end
 
--- Cuando un nuevo huevo spawnea libre en el mapa
 workspace.DescendantAdded:Connect(function(desc)
     task.wait(0.1)
     evaluateInstance(desc)
 end)
 
--- Cuando un huevo es recogido o destruido
 workspace.DescendantRemoving:Connect(function(desc)
     if trackedRegistry[desc] then
         removeVisuals(desc)
@@ -276,19 +293,19 @@ end)
 ------------------------------------------------------------------------
 -- 7. BUCLE DE DISTANCIAS
 ------------------------------------------------------------------------
-local elapsed = 0
+local accumulated = 0
 
 RunService.RenderStepped:Connect(function(dt: number)
-    elapsed += dt
-    if elapsed < CONFIG.UpdateInterval then return end
-    elapsed = 0
+    accumulated += dt
+    if accumulated < CONFIG.UpdateInterval then return end
+    accumulated = 0
 
     local character = localPlayer.Character
     local rootPart = character and character:FindFirstChild("HumanoidRootPart") :: BasePart?
 
     for instance, entry in pairs(trackedRegistry) do
-        -- Si el huevo fue colocado en una base mientras existía, removerlo
-        if not instance.Parent or not entry.TargetPart.Parent or isInBlacklistedAncestor(instance) then
+        -- Si fue destruido o colocado en base de jugador, removerlo
+        if not instance.Parent or not entry.TargetPart.Parent or isInPlayerBase(instance) then
             removeVisuals(instance)
             continue
         end
