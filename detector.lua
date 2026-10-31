@@ -1,316 +1,257 @@
 --!strict
 --[[
     ========================================================================
-    STEAL PANEL - DETECTOR AUTOMÁTICO DE HUEVOS REALES
+    SISTEMA MODULAR DE ESP Y RASTREO VISUAL DE OBJETOS EN TIEMPO REAL
     ========================================================================
-    Escanea el Workspace en tiempo real para detectar los huevos reales 
-    existentes en el mapa, mostrando sus nombres reales, distancia y opción de rastreo.
+    Entorno: Roblox Studio (LocalScript)
+    Ubicación recomendada: StarterPlayer -> StarterPlayerScripts (o StarterGui)
+    
+    Funcionalidades:
+      1. Escaneo dinámico y continuo en Workspace (coincidencia de nombres).
+      2. Generación programática de Highlight y BillboardGui sobre el objetivo.
+      3. Cálculo optimizado de distancias en studs mediante RunService.RenderStepped.
+      4. Limpieza automática al destruirse objetos y eliminación de instancias previas.
 ]]
 
+-- Servicios del motor
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 
 local localPlayer = Players.LocalPlayer
 local playerGui = localPlayer:WaitForChild("PlayerGui")
 
-local THEME = {
-    Bg = Color3.fromRGB(20, 22, 28),
-    CardBg = Color3.fromRGB(30, 33, 42),
-    Accent = Color3.fromRGB(255, 185, 45),
-    Header = Color3.fromRGB(26, 28, 36),
-    Text = Color3.fromRGB(245, 245, 245),
-    Muted = Color3.fromRGB(150, 155, 170),
-    Success = Color3.fromRGB(46, 204, 113),
+------------------------------------------------------------------------
+-- 1. CONFIGURACIÓN DEL SISTEMA
+------------------------------------------------------------------------
+local CONFIG = {
+    -- Identificador único para evitar duplicación del GUI en re-ejecuciones
+    GuiIdentifier = "CustomVisualESP_Container",
+
+    -- Palabras clave a rastrear (en minúsculas)
+    Keywords = {"egg", "huevo"},
+
+    -- Configuración estética del Highlight (silueta 3D)
+    HighlightColor = Color3.fromRGB(255, 185, 45),     -- Tono dorado / ámbar
+    HighlightOutline = Color3.fromRGB(255, 255, 255),   -- Contorno blanco
+    FillTransparency = 0.5,                             -- Opacidad del relleno interior
+    OutlineTransparency = 0.1,                          -- Opacidad de los bordes externos
+
+    -- Configuración estética del BillboardGui (texto flotante)
+    LabelTextColor = Color3.fromRGB(255, 220, 100),
+    LabelStrokeColor = Color3.fromRGB(15, 15, 20),
+    TextSize = 12,
+    StudsOffset = Vector3.new(0, 2.8, 0),               -- Elevación sobre el objeto
+
+    -- Intervalo de refresco para el cálculo de distancias (en segundos)
+    UpdateInterval = 0.1,
 }
 
 ------------------------------------------------------------------------
--- 1. LIMPIEZA PREVENTIVA
+-- 2. CONTROL DE INSTANCIAS PREVIAS (Idempotencia)
 ------------------------------------------------------------------------
-local GUI_NAME = "StealPanel_AutoEggTracker"
-local prevGui = playerGui:FindFirstChild(GUI_NAME)
-if prevGui then
-    prevGui:Destroy()
+-- Busca y destruye cualquier contenedor previo para evitar duplicados en memoria
+local function cleanupPreviousInstances()
+    local existingContainer = playerGui:FindFirstChild(CONFIG.GuiIdentifier)
+    if existingContainer then
+        existingContainer:Destroy()
+    end
+end
+
+cleanupPreviousInstances()
+
+-- Contenedor principal para almacenar todos los BillboardGuis y Highlights
+local espFolder = Instance.new("Folder")
+espFolder.Name = CONFIG.GuiIdentifier
+espFolder.Parent = playerGui
+
+------------------------------------------------------------------------
+-- 3. ESTRUCTURAS DE DATOS Y ESTADO
+------------------------------------------------------------------------
+type TrackedEntry = {
+    Instance: Instance,
+    TargetPart: BasePart,
+    Billboard: BillboardGui,
+    Label: TextLabel,
+    Highlight: Highlight,
+    AncestryConn: RBXScriptConnection,
+}
+
+-- Registro de objetos actualmente procesados
+local trackedRegistry: {[Instance]: TrackedEntry} = {}
+
+------------------------------------------------------------------------
+-- 4. VALIDACIÓN Y FILTRADO DE OBJETOS
+------------------------------------------------------------------------
+
+-- Extrae la parte física (BasePart) para anclar los elementos visuales
+local function getPhysicalPart(instance: Instance): BasePart?
+    if instance:IsA("BasePart") then
+        return instance
+    elseif instance:IsA("Model") then
+        return instance.PrimaryPart or instance:FindFirstChildWhichIsA("BasePart")
+    end
+    return nil
+end
+
+-- Determina si el objeto califica según las palabras clave configuradas
+local function matchesFilter(instance: Instance): boolean
+    -- Ignorar personajes de jugadores
+    if instance:FindFirstAncestorWhichIsA("Player") or instance:FindFirstChildOfClass("Humanoid") then
+        return false
+    end
+
+    local nameLower = string.lower(instance.Name)
+    for _, kw in ipairs(CONFIG.Keywords) do
+        if string.find(nameLower, kw) then
+            return true
+        end
+    end
+    return false
 end
 
 ------------------------------------------------------------------------
--- 2. ESTADO DINÁMICO
+-- 5. CREACIÓN Y DESTRUCCIÓN DE ELEMENTOS VISUALES
 ------------------------------------------------------------------------
-type RealEggEntry = {
-    Card: Frame,
-    DistLabel: TextLabel,
-    TargetInstance: Instance,
-    TargetPart: BasePart,
-    Billboard: BillboardGui?,
-    Highlight: Highlight?,
-}
 
-local detectedEggs: {[Instance]: RealEggEntry} = {}
-
-------------------------------------------------------------------------
--- 3. CONSTRUCCIÓN DE LA INTERFAZ
-------------------------------------------------------------------------
-local screenGui = Instance.new("ScreenGui")
-screenGui.Name = GUI_NAME
-screenGui.ResetOnSpawn = false
-screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-
-local mainFrame = Instance.new("Frame")
-mainFrame.Name = "StealPanelFrame"
-mainFrame.Size = UDim2.new(0, 360, 0, 480)
-mainFrame.Position = UDim2.new(1, -380, 0.5, -240)
-mainFrame.BackgroundColor3 = THEME.Bg
-mainFrame.BorderSizePixel = 0
-mainFrame.Active = true
-mainFrame.Draggable = true
-mainFrame.Parent = screenGui
-
-local corner = Instance.new("UICorner")
-corner.CornerRadius = UDim.new(0, 12)
-corner.Parent = mainFrame
-
-local stroke = Instance.new("UIStroke")
-stroke.Color = Color3.fromRGB(55, 62, 78)
-stroke.Thickness = 1.2
-stroke.Parent = mainFrame
-
--- Encabezado
-local header = Instance.new("Frame")
-header.Size = UDim2.new(1, 0, 0, 50)
-header.BackgroundColor3 = THEME.Header
-header.BorderSizePixel = 0
-header.Parent = mainFrame
-
-local headerCorner = Instance.new("UICorner")
-headerCorner.CornerRadius = UDim.new(0, 12)
-headerCorner.Parent = header
-
-local title = Instance.new("TextLabel")
-title.Size = UDim2.new(1, -20, 1, 0)
-title.Position = UDim2.new(0, 14, 0, 0)
-title.BackgroundTransparency = 1
-title.Text = "⚡ DETECTOR EN VIVO DE HUEVOS"
-title.TextColor3 = THEME.Accent
-title.Font = Enum.Font.GothamBold
-title.TextSize = 14
-title.TextXAlignment = Enum.TextXAlignment.Left
-title.Parent = header
-
--- Lista desplazable para los huevos reales encontrados
-local scrollList = Instance.new("ScrollingFrame")
-scrollList.Size = UDim2.new(1, -20, 1, -70)
-scrollList.Position = UDim2.new(0, 10, 0, 60)
-scrollList.BackgroundTransparency = 1
-scrollList.BorderSizePixel = 0
-scrollList.ScrollBarThickness = 4
-scrollList.ScrollBarImageColor3 = THEME.Accent
-scrollList.AutomaticCanvasSize = Enum.AutomaticSize.Y
-scrollList.Parent = mainFrame
-
-local listLayout = Instance.new("UIListLayout")
-listLayout.Padding = UDim.new(0, 8)
-listLayout.SortOrder = Enum.SortOrder.LayoutOrder
-listLayout.Parent = scrollList
-
-------------------------------------------------------------------------
--- 4. FUNCIONES DE RASTREO VISUAL
-------------------------------------------------------------------------
-local function toggleTracker(eggInstance: Instance, part: BasePart, eggName: string)
-    local entry = detectedEggs[eggInstance]
+-- Elimina los elementos visuales asociados a un objeto y libera conexiones
+local function removeVisuals(targetInstance: Instance)
+    local entry = trackedRegistry[targetInstance]
     if not entry then return end
+
+    if entry.AncestryConn then
+        entry.AncestryConn:Disconnect()
+    end
 
     if entry.Billboard then
         entry.Billboard:Destroy()
-        entry.Billboard = nil
-        if entry.Highlight then
-            entry.Highlight:Destroy()
-            entry.Highlight = nil
-        end
-        return
     end
 
-    local bb = Instance.new("BillboardGui")
-    bb.Name = "StealIndicator_" .. eggName
-    bb.Size = UDim2.new(0, 130, 0, 42)
-    bb.StudsOffset = Vector3.new(0, 3, 0)
-    bb.AlwaysOnTop = true
-    bb.Adornee = part
-    bb.Parent = screenGui
+    if entry.Highlight then
+        entry.Highlight:Destroy()
+    end
 
-    local bbLabel = Instance.new("TextLabel")
-    bbLabel.Size = UDim2.new(1, 0, 1, 0)
-    bbLabel.BackgroundTransparency = 1
-    bbLabel.Text = "🎯 [OBJETIVO]\n" .. eggName
-    bbLabel.TextColor3 = THEME.Accent
-    bbLabel.TextStrokeTransparency = 0.2
-    bbLabel.Font = Enum.Font.GothamBold
-    bbLabel.TextSize = 11
-    bbLabel.Parent = bb
-
-    local highlight = Instance.new("Highlight")
-    highlight.FillColor = THEME.Accent
-    highlight.OutlineColor = Color3.fromRGB(255, 255, 255)
-    highlight.FillTransparency = 0.4
-    highlight.OutlineTransparency = 0.2
-    highlight.Adornee = eggInstance
-    highlight.Parent = screenGui
-
-    entry.Billboard = bb
-    entry.Highlight = highlight
+    trackedRegistry[targetInstance] = nil
 end
 
-------------------------------------------------------------------------
--- 5. GESTIÓN DE INTERFAZ PARA CADA HUEVO REAL ENCONTRADO
-------------------------------------------------------------------------
-local function addEggCard(eggInstance: Instance, part: BasePart)
-    if detectedEggs[eggInstance] then return end
+-- Genera el Highlight y BillboardGui sobre el objetivo
+local function createVisuals(targetInstance: Instance, targetPart: BasePart)
+    if trackedRegistry[targetInstance] then return end
 
-    local eggName = eggInstance.Name
+    -- A) Crear Highlight (silueta visible a través de paredes)
+    local highlight = Instance.new("Highlight")
+    highlight.Name = "ESP_Highlight_" .. targetInstance.Name
+    highlight.Adornee = targetInstance
+    highlight.FillColor = CONFIG.HighlightColor
+    highlight.OutlineColor = CONFIG.HighlightOutline
+    highlight.FillTransparency = CONFIG.FillTransparency
+    highlight.OutlineTransparency = CONFIG.OutlineTransparency
+    highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+    highlight.Parent = espFolder
 
-    local card = Instance.new("Frame")
-    card.Size = UDim2.new(1, 0, 0, 64)
-    card.BackgroundColor3 = THEME.CardBg
-    card.BorderSizePixel = 0
-    card.Parent = scrollList
+    -- B) Crear BillboardGui (indicador de texto flotante 3D)
+    local billboard = Instance.new("BillboardGui")
+    billboard.Name = "ESP_Billboard_" .. targetInstance.Name
+    billboard.Adornee = targetPart
+    billboard.Size = UDim2.new(0, 140, 0, 36)
+    billboard.StudsOffset = CONFIG.StudsOffset
+    billboard.AlwaysOnTop = true
+    billboard.MaxDistance = 1500 -- Distancia máxima de visibilidad en studs
+    billboard.Parent = espFolder
 
-    local cardCorner = Instance.new("UICorner")
-    cardCorner.CornerRadius = UDim.new(0, 8)
-    cardCorner.Parent = card
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(1, 0, 1, 0)
+    label.BackgroundTransparency = 1
+    label.Font = Enum.Font.GothamBold
+    label.TextSize = CONFIG.TextSize
+    label.TextColor3 = CONFIG.LabelTextColor
+    label.TextStrokeTransparency = 0.2
+    label.TextStrokeColor3 = CONFIG.LabelStrokeColor
+    label.Text = string.format("🥚 %s\n[-- studs]", targetInstance.Name)
+    label.Parent = billboard
 
-    local cardStroke = Instance.new("UIStroke")
-    cardStroke.Color = THEME.Accent
-    cardStroke.Thickness = 1
-    cardStroke.Parent = card
-
-    local nameLabel = Instance.new("TextLabel")
-    nameLabel.Size = UDim2.new(0, 220, 0, 20)
-    nameLabel.Position = UDim2.new(0, 12, 0, 10)
-    nameLabel.BackgroundTransparency = 1
-    nameLabel.Text = "🥚 " .. eggName
-    nameLabel.TextColor3 = THEME.Text
-    nameLabel.Font = Enum.Font.GothamBold
-    nameLabel.TextSize = 13
-    nameLabel.TextXAlignment = Enum.TextXAlignment.Left
-    nameLabel.TextTruncate = Enum.TextTruncate.AtEnd
-    nameLabel.Parent = card
-
-    local distLabel = Instance.new("TextLabel")
-    distLabel.Size = UDim2.new(0, 220, 0, 18)
-    distLabel.Position = UDim2.new(0, 12, 0, 32)
-    distLabel.BackgroundTransparency = 1
-    distLabel.Text = "📍 Calculando distancia..."
-    distLabel.TextColor3 = THEME.Success
-    distLabel.Font = Enum.Font.Gotham
-    distLabel.TextSize = 11
-    distLabel.TextXAlignment = Enum.TextXAlignment.Left
-    distLabel.Parent = card
-
-    local trackBtn = Instance.new("TextButton")
-    trackBtn.Size = UDim2.new(0, 78, 0, 32)
-    trackBtn.Position = UDim2.new(1, -88, 0.5, -16)
-    trackBtn.BackgroundColor3 = THEME.Accent
-    trackBtn.Text = "RASTREAR"
-    trackBtn.TextColor3 = Color3.fromRGB(20, 20, 20)
-    trackBtn.Font = Enum.Font.GothamBold
-    trackBtn.TextSize = 10
-    trackBtn.BorderSizePixel = 0
-    trackBtn.Parent = card
-
-    local btnCorner = Instance.new("UICorner")
-    btnCorner.CornerRadius = UDim.new(0, 6)
-    btnCorner.Parent = trackBtn
-
-    trackBtn.MouseButton1Click:Connect(function()
-        if part and part.Parent then
-            toggleTracker(eggInstance, part, eggName)
+    -- C) Listener de eliminación: limpia visuales si el objeto sale de la jerarquía
+    local ancestryConn: RBXScriptConnection
+    ancestryConn = targetInstance.AncestryChanged:Connect(function(_, parent)
+        if not parent then
+            removeVisuals(targetInstance)
         end
     end)
 
-    detectedEggs[eggInstance] = {
-        Card = card,
-        DistLabel = distLabel,
-        TargetInstance = eggInstance,
-        TargetPart = part,
-        Billboard = nil,
-        Highlight = nil,
+    -- Guardar en el registro
+    trackedRegistry[targetInstance] = {
+        Instance = targetInstance,
+        TargetPart = targetPart,
+        Billboard = billboard,
+        Label = label,
+        Highlight = highlight,
+        AncestryConn = ancestryConn,
     }
 end
 
-local function removeEggCard(eggInstance: Instance)
-    local entry = detectedEggs[eggInstance]
-    if entry then
-        if entry.Billboard then entry.Billboard:Destroy() end
-        if entry.Highlight then entry.Highlight:Destroy() end
-        entry.Card:Destroy()
-        detectedEggs[eggInstance] = nil
-    end
-end
-
-------------------------------------------------------------------------
--- 6. ESCANEO DINÁMICO EN TIEMPO REAL (Busca objetos reales con "Egg" en el nombre)
-------------------------------------------------------------------------
-local function scanWorkspaceForEggs()
-    local activeInstances = {}
-
-    for _, desc in ipairs(workspace:GetDescendants()) do
-        -- Filtra por nombre real que contenga "egg" (ajusta esto si el juego usa otro término)
-        if desc:IsA("Model") or desc:IsA("BasePart") then
-            if string.find(string.lower(desc.Name), "egg") then
-                local part = desc:IsA("BasePart") and desc or (desc:IsA("Model") and (desc.PrimaryPart or desc:FindFirstChildWhichIsA("BasePart")))
-                if part then
-                    activeInstances[desc] = part
-                    addEggCard(desc, part)
-                end
-            end
-        end
-    end
-
-    -- Remover de la lista los huevos que ya desaparecieron del mapa
-    for eggInst, _ in pairs(detectedEggs) do
-        if not activeInstances[eggInst] or not eggInst.Parent then
-            removeEggCard(eggInst)
+-- Inspecciona una instancia para registrarla si cumple los criterios
+local function evaluateInstance(instance: Instance)
+    if matchesFilter(instance) then
+        local physicalPart = getPhysicalPart(instance)
+        if physicalPart then
+            createVisuals(instance, physicalPart)
         end
     end
 end
 
 ------------------------------------------------------------------------
--- 7. BUCLE PRINCIPAL DE ACTUALIZACIÓN
+-- 6. ESCANEO INICIAL Y DETECCIÓN EN TIEMPO REAL
 ------------------------------------------------------------------------
-local scanTimer = 0
-local distTimer = 0
 
-RunService.RenderStepped:Connect(function(dt)
-    scanTimer += dt
-    distTimer += dt
+-- Escaneo de elementos ya existentes en el Workspace
+for _, descendant in ipairs(workspace:GetDescendants()) do
+    evaluateInstance(descendant)
+end
 
-    -- Escanear nuevos huevos en el mapa cada 1 segundo
-    if scanTimer >= 1.0 then
-        scanTimer = 0
-        pcall(scanWorkspaceForEggs)
-    end
+-- Detección reactiva: nuevos objetos que aparecen en el Workspace
+workspace.DescendantAdded:Connect(function(descendant)
+    -- Breve retardo para permitir que carguen las partes hijas si es un modelo compuesto
+    task.wait(0.05)
+    evaluateInstance(descendant)
+end)
 
-    -- Actualizar distancias en vivo cada 0.15 segundos
-    if distTimer >= 0.15 then
-        distTimer = 0
-        local char = localPlayer.Character
-        local root = char and char:FindFirstChild("HumanoidRootPart") :: BasePart?
-
-        for _, entry in pairs(detectedEggs) do
-            if entry.TargetPart and entry.TargetPart.Parent and root then
-                local dist = (root.Position - entry.TargetPart.Position).Magnitude
-                entry.DistLabel.Text = string.format("📍 Distancia: %.0f studs", dist)
-                
-                if entry.Billboard then
-                    local lbl = entry.Billboard:FindFirstChildWhichIsA("TextLabel")
-                    if lbl then
-                        lbl.Text = string.format("🎯 [OBJETIVO]\n%s (%.0f studs)", entry.TargetInstance.Name, dist)
-                    end
-                end
-            else
-                removeEggCard(entry.TargetInstance)
-            end
-        end
+-- Limpieza reactiva: objetos que son removidos del Workspace
+workspace.DescendantRemoving:Connect(function(descendant)
+    if trackedRegistry[descendant] then
+        removeVisuals(descendant)
     end
 end)
 
-screenGui.Parent = playerGui
-print("[Steal Panel] Escáner en tiempo real de huevos reales activado.")
+------------------------------------------------------------------------
+-- 7. BUCLE DE ACTUALIZACIÓN CON CONTROL DE RENDIMIENTO (THROTTLING)
+------------------------------------------------------------------------
+local accumulatedTime = 0
+
+RunService.RenderStepped:Connect(function(deltaTime: number)
+    accumulatedTime += deltaTime
+
+    -- Limitar ejecución al intervalo establecido para preservar recursos
+    if accumulatedTime < CONFIG.UpdateInterval then
+        return
+    end
+    accumulatedTime = 0
+
+    -- Obtener la posición del jugador local
+    local character = localPlayer.Character
+    local rootPart = character and character:FindFirstChild("HumanoidRootPart") :: BasePart?
+
+    for instance, entry in pairs(trackedRegistry) do
+        -- Validación de existencia en el árbol de instancias
+        if not instance.Parent or not entry.TargetPart.Parent then
+            removeVisuals(instance)
+            continue
+        end
+
+        -- Actualizar texto con la distancia calculada en studs
+        if rootPart then
+            local distance = (rootPart.Position - entry.TargetPart.Position).Magnitude
+            entry.Label.Text = string.format("🥚 %s\n[%.0f studs]", instance.Name, distance)
+        else
+            entry.Label.Text = string.format("🥚 %s\n[--]", instance.Name)
+        end
+    end
+end)
